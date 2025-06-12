@@ -124,6 +124,20 @@ app.get('/inscricoes', (req, res) => {
   );
 });
 
+// Rota para listar todas as oficinas
+app.get('/oficinas', (req, res) => {
+  db.all(`SELECT
+            id,
+            nome,
+            local,
+            limite_turno1,
+            limite_turno2
+          FROM oficinas`, (err, rows) => {
+    if (err) return res.status(500).json({ error: err.message });
+    res.json(rows);
+  });
+});
+
 app.post('/fresh', (req, res) => {
   db.serialize(() => {
     db.run("DELETE FROM inscricoes");
