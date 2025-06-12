@@ -51,6 +51,53 @@ app.post('/seed', (req, res) => {
   res.send('Oficinas inseridas com sucesso');
 });
 
+app.post('/editar-inscricao', (req, res) => {
+  const { email, nova_oficina_id, novo_turno } = req.body;
+
+  if (!['turno1', 'turno2'].includes(novo_turno)) {
+    return res.status(400).json({ error: 'Turno inválido' });
+  }
+
+  db.get("SELECT * FROM usuarios WHERE email = ?", [email], (err, usuario) => {
+    if (err || !usuario) return res.status(404).json({ error: 'Usuário não encontrado' });
+
+    db.get("SELECT * FROM inscricoes WHERE usuario_id = ?", [usuario.id], (err, inscricao) => {
+      if (err || !inscricao) return res.status(404).json({ error: 'Inscrição atual não encontrada' });
+
+      const campoAntigo = inscricao.turno === 'turno1' ? 'limite_turno1' : 'limite_turno2';
+      const campoNovo = novo_turno === 'turno1' ? 'limite_turno1' : 'limite_turno2';
+
+      db.serialize(() => {
+        // 1. Restaurar vaga na oficina antiga
+        db.run(`UPDATE oficinas SET ${campoAntigo} = ${campoAntigo} + 1 WHERE id = ?`, [inscricao.oficina_id]);
+
+        // 2. Remover inscrição anterior
+        db.run("DELETE FROM inscricoes WHERE id = ?", [inscricao.id]);
+
+        // 3. Verificar se há vaga na nova oficina
+        db.get(`SELECT ${campoNovo} as limite FROM oficinas WHERE id = ?`, [nova_oficina_id], (err, novaOficina) => {
+          if (err || !novaOficina) return res.status(404).json({ error: 'Nova oficina não encontrada' });
+
+          if (novaOficina.limite <= 0) {
+            return res.status(400).json({ error: 'Limite de vagas atingido na nova oficina' });
+          }
+
+          // 4. Criar nova inscrição
+          db.run("INSERT INTO inscricoes (usuario_id, oficina_id, turno) VALUES (?, ?, ?)",
+            [usuario.id, nova_oficina_id, novo_turno], function (err) {
+              if (err) return res.status(500).json({ error: err.message });
+
+              // 5. Decrementar vaga da nova oficina
+              db.run(`UPDATE oficinas SET ${campoNovo} = ${campoNovo} - 1 WHERE id = ?`, [nova_oficina_id]);
+
+              res.json({ sucesso: true, mensagem: "Inscrição atualizada com sucesso" });
+            });
+        });
+      });
+    });
+  });
+});
+
 // Inscrição com decremento de vagas
 app.post('/inscrever', (req, res) => {
   const { email, nome, oficina_id, turno } = req.body;
@@ -148,8 +195,6 @@ app.post('/fresh', (req, res) => {
     });
   });
 });
-
-
 
 app.use(express.json());
 app.listen(PORT, () => {
