@@ -12,31 +12,31 @@ app.use(bodyParser.json());
 
 // Criação das tabelas
 
-// db.serialize(() => {
-//   db.run(`CREATE TABLE IF NOT EXISTS usuarios (
-//     id INTEGER PRIMARY KEY AUTOINCREMENT,
-//     nome TEXT NOT NULL,
-//     email TEXT UNIQUE NOT NULL
-//   )`);
+db.serialize(() => {
+  db.run(`CREATE TABLE IF NOT EXISTS usuarios (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    nome TEXT NOT NULL,
+    email TEXT UNIQUE NOT NULL
+  )`);
 
-//   db.run(`CREATE TABLE IF NOT EXISTS oficinas (
-//     id INTEGER PRIMARY KEY AUTOINCREMENT,
-//     nome TEXT,
-//     local TEXT,
-//     limite_turno1 INTEGER,
-//     limite_turno2 INTEGER
-//   )`);
+  db.run(`CREATE TABLE IF NOT EXISTS oficinas (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    nome TEXT,
+    local TEXT,
+    limite_turno1 INTEGER,
+    limite_turno2 INTEGER
+  )`);
 
-//   db.run(`CREATE TABLE IF NOT EXISTS inscricoes (
-//     id INTEGER PRIMARY KEY AUTOINCREMENT,
-//     usuario_id INTEGER,
-//     oficina_id INTEGER,
-//     turno TEXT CHECK(turno IN ('turno1', 'turno2')),
-//     UNIQUE(usuario_id, oficina_id),
-//     FOREIGN KEY(usuario_id) REFERENCES usuarios(id),
-//     FOREIGN KEY(oficina_id) REFERENCES oficinas(id)
-//   )`);
-// });
+  db.run(`CREATE TABLE IF NOT EXISTS inscricoes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    usuario_id INTEGER,
+    oficina_id INTEGER,
+    turno TEXT CHECK(turno IN ('turno1', 'turno2')),
+    UNIQUE(usuario_id, oficina_id),
+    FOREIGN KEY(usuario_id) REFERENCES usuarios(id),
+    FOREIGN KEY(oficina_id) REFERENCES oficinas(id)
+  )`);
+});
 
 // Rota para popular oficinas (executar uma vez)
 app.post('/seed', (req, res) => {
