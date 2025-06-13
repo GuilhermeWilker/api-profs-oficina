@@ -1,202 +1,204 @@
+require('dotenv').config()
 const express = require('express');
-const sqlite3 = require('sqlite3').verbose();
 const bodyParser = require('body-parser');
 const cors = require('cors');
+const { Pool } = require('pg');
 
 const app = express();
-const db = new sqlite3.Database('dados.sqlite');
-const PORT = 4000;
+const PORT = process.env.PORT || 4000;
+
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false } // Necessário para Render
+});
 
 app.use(cors());
 app.use(bodyParser.json());
 
 // Criação das tabelas
+const initDB = async () => {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS usuarios (
+      id SERIAL PRIMARY KEY,
+      nome TEXT NOT NULL,
+      email TEXT UNIQUE NOT NULL
+    );
+  `);
 
-db.serialize(() => {
-  db.run(`CREATE TABLE IF NOT EXISTS usuarios (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    nome TEXT NOT NULL,
-    email TEXT UNIQUE NOT NULL
-  )`);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS oficinas (
+      id SERIAL PRIMARY KEY,
+      nome TEXT,
+      local TEXT,
+      limite_turno1 INTEGER,
+      limite_turno2 INTEGER
+    );
+  `);
 
-  db.run(`CREATE TABLE IF NOT EXISTS oficinas (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    nome TEXT,
-    local TEXT,
-    limite_turno1 INTEGER,
-    limite_turno2 INTEGER
-  )`);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS inscricoes (
+      id SERIAL PRIMARY KEY,
+      usuario_id INTEGER REFERENCES usuarios(id),
+      oficina_id INTEGER REFERENCES oficinas(id),
+      turno TEXT CHECK (turno IN ('turno1', 'turno2')),
+      UNIQUE(usuario_id, oficina_id)
+    );
+  `);
+};
 
-  db.run(`CREATE TABLE IF NOT EXISTS inscricoes (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    usuario_id INTEGER,
-    oficina_id INTEGER,
-    turno TEXT CHECK(turno IN ('turno1', 'turno2')),
-    UNIQUE(usuario_id, oficina_id),
-    FOREIGN KEY(usuario_id) REFERENCES usuarios(id),
-    FOREIGN KEY(oficina_id) REFERENCES oficinas(id)
-  )`);
-});
+initDB();
 
-// Rota para popular oficinas (executar uma vez)
-app.post('/seed', (req, res) => {
+// Rota para popular oficinas
+app.post('/seed', async (req, res) => {
   const oficinas = req.body;
-  db.serialize(() => {
-    const stmt = db.prepare(`INSERT INTO oficinas (nome, local, limite_turno1, limite_turno2) VALUES (?, ?, ?, ?)`);
-    oficinas.forEach(o => {
-      stmt.run(o.nome, o.local, o.limite_turno1, o.limite_turno2);
-    });
-    stmt.finalize();
-  });
-  res.send('Oficinas inseridas com sucesso');
+  const client = await pool.connect();
+  try {
+    for (const o of oficinas) {
+      await client.query(
+        `INSERT INTO oficinas (nome, local, limite_turno1, limite_turno2)
+         VALUES ($1, $2, $3, $4)`,
+        [o.nome, o.local, o.limite_turno1, o.limite_turno2]
+      );
+    }
+    res.send('Oficinas inseridas com sucesso');
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
 });
 
-app.post('/editar-inscricao', (req, res) => {
+app.post('/editar-inscricao', async (req, res) => {
   const { email, nova_oficina_id, novo_turno } = req.body;
 
   if (!['turno1', 'turno2'].includes(novo_turno)) {
     return res.status(400).json({ error: 'Turno inválido' });
   }
 
-  db.get("SELECT * FROM usuarios WHERE email = ?", [email], (err, usuario) => {
-    if (err || !usuario) return res.status(404).json({ error: 'Usuário não encontrado' });
+  const client = await pool.connect();
+  try {
+    const usuario = await client.query("SELECT * FROM usuarios WHERE email = $1", [email]);
+    if (usuario.rowCount === 0) return res.status(404).json({ error: 'Usuário não encontrado' });
 
-    db.get("SELECT * FROM inscricoes WHERE usuario_id = ?", [usuario.id], (err, inscricao) => {
-      if (err || !inscricao) return res.status(404).json({ error: 'Inscrição atual não encontrada' });
+    const user = usuario.rows[0];
 
-      const campoAntigo = inscricao.turno === 'turno1' ? 'limite_turno1' : 'limite_turno2';
-      const campoNovo = novo_turno === 'turno1' ? 'limite_turno1' : 'limite_turno2';
+    const inscricao = await client.query("SELECT * FROM inscricoes WHERE usuario_id = $1", [user.id]);
+    if (inscricao.rowCount === 0) return res.status(404).json({ error: 'Inscrição não encontrada' });
 
-      db.serialize(() => {
-        // 1. Restaurar vaga na oficina antiga
-        db.run(`UPDATE oficinas SET ${campoAntigo} = ${campoAntigo} + 1 WHERE id = ?`, [inscricao.oficina_id]);
+    const i = inscricao.rows[0];
+    const campoAntigo = i.turno === 'turno1' ? 'limite_turno1' : 'limite_turno2';
+    const campoNovo = novo_turno === 'turno1' ? 'limite_turno1' : 'limite_turno2';
 
-        // 2. Remover inscrição anterior
-        db.run("DELETE FROM inscricoes WHERE id = ?", [inscricao.id]);
+    await client.query(`UPDATE oficinas SET ${campoAntigo} = ${campoAntigo} + 1 WHERE id = $1`, [i.oficina_id]);
+    await client.query("DELETE FROM inscricoes WHERE id = $1", [i.id]);
 
-        // 3. Verificar se há vaga na nova oficina
-        db.get(`SELECT ${campoNovo} as limite FROM oficinas WHERE id = ?`, [nova_oficina_id], (err, novaOficina) => {
-          if (err || !novaOficina) return res.status(404).json({ error: 'Nova oficina não encontrada' });
+    const novaOficina = await client.query(`SELECT ${campoNovo} FROM oficinas WHERE id = $1`, [nova_oficina_id]);
+    if (novaOficina.rowCount === 0) return res.status(404).json({ error: 'Nova oficina não encontrada' });
 
-          if (novaOficina.limite <= 0) {
-            return res.status(400).json({ error: 'Limite de vagas atingido na nova oficina' });
-          }
+    if (novaOficina.rows[0][campoNovo] <= 0) {
+      return res.status(400).json({ error: 'Limite de vagas atingido na nova oficina' });
+    }
 
-          // 4. Criar nova inscrição
-          db.run("INSERT INTO inscricoes (usuario_id, oficina_id, turno) VALUES (?, ?, ?)",
-            [usuario.id, nova_oficina_id, novo_turno], function (err) {
-              if (err) return res.status(500).json({ error: err.message });
+    await client.query("INSERT INTO inscricoes (usuario_id, oficina_id, turno) VALUES ($1, $2, $3)",
+      [user.id, nova_oficina_id, novo_turno]);
 
-              // 5. Decrementar vaga da nova oficina
-              db.run(`UPDATE oficinas SET ${campoNovo} = ${campoNovo} - 1 WHERE id = ?`, [nova_oficina_id]);
+    await client.query(`UPDATE oficinas SET ${campoNovo} = ${campoNovo} - 1 WHERE id = $1`, [nova_oficina_id]);
 
-              res.json({ sucesso: true, mensagem: "Inscrição atualizada com sucesso" });
-            });
-        });
-      });
-    });
-  });
+    res.json({ sucesso: true, mensagem: "Inscrição atualizada com sucesso" });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
 });
 
-// Inscrição com decremento de vagas
-app.post('/inscrever', (req, res) => {
+app.post('/inscrever', async (req, res) => {
   const { email, nome, oficina_id, turno } = req.body;
 
   if (!['turno1', 'turno2'].includes(turno)) {
     return res.status(400).json({ error: 'Turno inválido' });
   }
 
-  db.get("SELECT * FROM usuarios WHERE email = ?", [email], (err, usuario) => {
-    if (err) return res.status(500).json({ error: err.message });
+  const client = await pool.connect();
+  try {
+    let user = await client.query("SELECT * FROM usuarios WHERE email = $1", [email]);
+    let userId;
 
-    const continuar = (usuarioId) => {
-      db.get("SELECT * FROM inscricoes WHERE usuario_id = ? AND oficina_id = ?", [usuarioId, oficina_id], (err, inscricao) => {
-        if (err) return res.status(500).json({ error: err.message });
-        if (inscricao) return res.status(400).json({ error: 'Usuário já inscrito nessa oficina' });
-
-        const campoLimite = turno === 'turno1' ? 'limite_turno1' : 'limite_turno2';
-
-        db.get(`SELECT ${campoLimite} as limite FROM oficinas WHERE id = ?`, [oficina_id], (err, oficina) => {
-          if (err) return res.status(500).json({ error: err.message });
-          if (!oficina) return res.status(404).json({ error: 'Oficina não encontrada' });
-
-          if (oficina.limite <= 0) {
-            return res.status(400).json({ error: 'Limite de vagas atingido nesse turno' });
-          }
-
-          // Inserir a inscrição
-          db.run("INSERT INTO inscricoes (usuario_id, oficina_id, turno) VALUES (?, ?, ?)", [usuarioId, oficina_id, turno], function (err) {
-            if (err) return res.status(500).json({ error: err.message });
-
-            // Decrementar o limite do turno
-            db.run(`UPDATE oficinas SET ${campoLimite} = ${campoLimite} - 1 WHERE id = ?`, [oficina_id], function (err) {
-              if (err) return res.status(500).json({ error: 'Erro ao atualizar limite da oficina' });
-              res.json({ sucesso: true });
-            });
-          });
-        });
-      });
-    };
-
-    if (usuario) {
-      continuar(usuario.id);
+    if (user.rowCount > 0) {
+      userId = user.rows[0].id;
     } else {
-      db.run("INSERT INTO usuarios (nome, email) VALUES (?, ?)", [nome, email], function (err) {
-        if (err) return res.status(500).json({ error: err.message });
-        continuar(this.lastID);
-      });
+      const inserted = await client.query(
+        "INSERT INTO usuarios (nome, email) VALUES ($1, $2) RETURNING id",
+        [nome, email]
+      );
+      userId = inserted.rows[0].id;
     }
-  });
+
+    const exists = await client.query("SELECT * FROM inscricoes WHERE usuario_id = $1 AND oficina_id = $2", [userId, oficina_id]);
+    if (exists.rowCount > 0) return res.status(400).json({ error: 'Usuário já inscrito nessa oficina' });
+
+    const campo = turno === 'turno1' ? 'limite_turno1' : 'limite_turno2';
+    const oficina = await client.query(`SELECT ${campo} FROM oficinas WHERE id = $1`, [oficina_id]);
+
+    if (oficina.rowCount === 0) return res.status(404).json({ error: 'Oficina não encontrada' });
+    if (oficina.rows[0][campo] <= 0) return res.status(400).json({ error: 'Limite de vagas atingido' });
+
+    await client.query("INSERT INTO inscricoes (usuario_id, oficina_id, turno) VALUES ($1, $2, $3)",
+      [userId, oficina_id, turno]);
+
+    await client.query(`UPDATE oficinas SET ${campo} = ${campo} - 1 WHERE id = $1`, [oficina_id]);
+
+    res.json({ sucesso: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
 });
 
-// Listar inscrições com horários legíveis
-app.get('/inscricoes', (req, res) => {
-  db.all(`SELECT
-            u.nome,
-            u.email,
-            o.nome as oficina,
-            o.local,
-            CASE
-              WHEN i.turno = 'turno1' THEN '9h30 às 11h30'
-              WHEN i.turno = 'turno2' THEN '11h30 às 13h30'
-              ELSE i.turno
-            END as horario
-          FROM inscricoes i
-          JOIN usuarios u ON u.id = i.usuario_id
-          JOIN oficinas o ON o.id = i.oficina_id`,
-    (err, rows) => {
-      if (err) return res.status(500).json({ error: err.message });
-      res.json(rows);
-    }
-  );
+app.get('/inscricoes', async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT
+        u.nome,
+        u.email,
+        o.nome as oficina,
+        o.local,
+        CASE
+          WHEN i.turno = 'turno1' THEN '9h30 às 11h30'
+          WHEN i.turno = 'turno2' THEN '11h30 às 13h30'
+          ELSE i.turno
+        END as horario
+      FROM inscricoes i
+      JOIN usuarios u ON u.id = i.usuario_id
+      JOIN oficinas o ON o.id = i.oficina_id
+    `);
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
-// Rota para listar todas as oficinas
-app.get('/oficinas', (req, res) => {
-  db.all(`SELECT
-            id,
-            nome,
-            local,
-            limite_turno1,
-            limite_turno2
-          FROM oficinas`, (err, rows) => {
-    if (err) return res.status(500).json({ error: err.message });
-    res.json(rows);
-  });
+app.get('/oficinas', async (req, res) => {
+  try {
+    const result = await pool.query("SELECT * FROM oficinas");
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
-app.post('/fresh', (req, res) => {
-  db.serialize(() => {
-    db.run("DELETE FROM inscricoes");
-    db.run("DELETE FROM usuarios");
-    db.run("DELETE FROM oficinas", (err) => {
-      if (err) return res.status(500).json({ error: 'Erro ao apagar oficinas' });
-      res.json({ sucesso: true, mensagem: "Todas as tabelas foram limpas com sucesso" });
-    });
-  });
+app.post('/fresh', async (req, res) => {
+  try {
+    await pool.query("DELETE FROM inscricoes");
+    await pool.query("DELETE FROM usuarios");
+    await pool.query("DELETE FROM oficinas");
+    res.json({ sucesso: true, mensagem: "Tabelas limpas com sucesso" });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
-app.use(express.json());
 app.listen(PORT, () => {
   console.log(`Servidor rodando em http://localhost:${PORT}`);
 });
